@@ -46,9 +46,10 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 IG_TOKEN = os.environ.get("IG_TOKEN", "")
 
+# Flickr envía la página completa (100 fotos por página) a programas que no se hacen
+# pasar por un navegador; a un navegador le manda solo 25 y carga el resto con JavaScript.
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/128.0 Safari/537.36",
+    "User-Agent": "milbeerista-bot/1.0 (+https://github.com)",
     "Accept-Language": "en-US,en;q=0.9",
 }
 
@@ -56,6 +57,7 @@ TRANSLATION_PROMPT = """You translate Catalan craft-beer reviews into natural En
 Rules:
 - Keep beer names, brewery names, place names, hop varieties, malt names and yeast strains exactly as written.
 - Keep numbers, IBUs and abbreviations as they are, but use a decimal point in numbers (6,7% -> 6.7%).
+- Translate every Catalan word, including short phrases such as "De Blanes" -> "From Blanes".
 - Keep the author's concise tasting-note style. Do not add or remove information.
 - Output only the English translation, with no quotes, notes or preamble."""
 
