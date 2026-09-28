@@ -29,6 +29,7 @@ CATCHUP_UNTIL = "2025-07-01"     # los turnos extra solo publican fotos anterior
 IG_USER_ID = "17841471139169973"  # milbeeristablog2
 IG_API = "https://graph.instagram.com/v23.0"
 GEMINI_MODEL = "gemini-flash-latest"
+GROQ_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "llama-3.3-70b-versatile"]
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 MAX_HASHTAGS = 30
 MAX_FAILURES = 3
@@ -41,6 +42,7 @@ IMAGES_DIR = "images"
 DRY_RUN = os.environ.get("DRY_RUN") == "1"
 EXTRA_SLOT = os.environ.get("EXTRA_SLOT") == "true"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 IG_TOKEN = os.environ.get("IG_TOKEN", "")
 
@@ -74,7 +76,10 @@ def ids_in_page(n, tries=3):
     """IDs de las fotos de una página del photostream (reintenta si sale vacía)."""
     for i in range(tries):
         page = fetch(f"https://www.flickr.com/photos/{FLICKR_USER}/page{n}") or ""
-        found = {int(x) for x in re.findall(r"staticflickr\.com/\d+/(\d{6,})_[0-9a-f]{6,}_", page)}
+        # Solo unas 20 fotos por página salen como imagen; el resto viene en los datos
+        # internos de la página (con barras escapadas \/ o como "id":"...").
+        found = {int(x) for x in re.findall(r"staticflickr\.com\\?/\d+\\?/(\d{6,})_[0-9a-f]{6,}_", page)}
+        found |= {int(x) for x in re.findall(r'"id"\s*:\s*"(\d{9,12})"', page)}
         if found:
             last = max([int(x) for x in re.findall(rf"/photos/{FLICKR_USER}/page(\d+)", page)] or [n])
             return found, last
@@ -87,6 +92,7 @@ def update_ids(ids):
     known = set(ids)
     first_run = not ids
     found, last_page = ids_in_page(1)
+    print(f"Página 1 de Flickr: {len(found)} fotos (de {last_page} páginas)")
     known |= found
     n = 1
     while n < last_page:
@@ -204,6 +210,29 @@ def translate_gemini(body):
     return "".join(p.get("text", "") for p in parts).strip()
 
 
+def translate_groq(body):
+    """Groq (gratis, sin tarjeta). Prueba varios modelos por si alguno deja de existir."""
+    last_error = ""
+    for model in GROQ_MODELS:
+        payload = {
+            "model": model,
+            "messages": [{"role": "system", "content": TRANSLATION_PROMPT},
+                         {"role": "user", "content": body}],
+            "temperature": 0.2,
+        }
+        if model.startswith("openai/gpt-oss"):
+            payload["reasoning_effort"] = "low"
+        r = requests.post("https://api.groq.com/openai/v1/chat/completions",
+                          headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                          json=payload, timeout=90)
+        if r.ok:
+            text = (r.json()["choices"][0]["message"].get("content") or "").strip()
+            if text:
+                return text
+        last_error = f"{model}: {r.status_code} {r.text[:200]}"
+    raise RuntimeError(f"Groq: {last_error}")
+
+
 def translate_claude(body):
     r = requests.post(
         "https://api.anthropic.com/v1/messages",
@@ -252,10 +281,11 @@ def translate_mymemory(body):
 
 
 def translate(body):
-    """Prueba los traductores en orden: Gemini, Claude y, si no, MyMemory (gratis, sin clave)."""
+    """Prueba los traductores en orden: Gemini, Groq, Claude y, si no, MyMemory (sin clave)."""
     if not body:
         return ""
-    for key, fn in ((GEMINI_API_KEY, translate_gemini), (ANTHROPIC_API_KEY, translate_claude)):
+    for key, fn in ((GEMINI_API_KEY, translate_gemini), (GROQ_API_KEY, translate_groq),
+                    (ANTHROPIC_API_KEY, translate_claude)):
         if key:
             try:
                 return fn(body)
