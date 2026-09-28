@@ -1,0 +1,40 @@
+name: Publicar en Instagram
+
+on:
+  schedule:
+    # Horas en UTC. En verano: 9, 12, 15, 18 y 21 h en Barcelona (en invierno, una hora antes).
+    # Los turnos de las 10 y las 16 UTC son "extra": solo publican mientras
+    # la cola vaya por fotos anteriores a julio de 2025. Después quedan 3 al día.
+    - cron: "0 7 * * *"
+    - cron: "0 10 * * *"
+    - cron: "0 13 * * *"
+    - cron: "0 16 * * *"
+    - cron: "0 19 * * *"
+  workflow_dispatch:
+    inputs:
+      prueba:
+        description: "Modo prueba (muestra el texto, no publica)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency: publicar
+
+jobs:
+  publicar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python publicar.py
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          IG_TOKEN: ${{ secrets.IG_TOKEN }}
+          DRY_RUN: ${{ inputs.prueba == true && '1' || '0' }}
+          EXTRA_SLOT: ${{ github.event.schedule == '0 10 * * *' || github.event.schedule == '0 16 * * *' }}
