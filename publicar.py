@@ -76,40 +76,49 @@ PHOTO_ID_RE = re.compile(r"staticflickr\.com\\?/\d+\\?/(\d{6,})_[0-9a-f]{6,}_")
 
 
 def ids_in_page(page, n, tries=3):
-    """Abre una página del photostream en Chromium, hace scroll y devuelve sus fotos.
-    (Flickr solo manda 25 fotos en el HTML; las otras 75 se cargan al hacer scroll.)"""
+    """Abre una página del photostream en Chromium, hace scroll hasta abajo y devuelve sus fotos.
+    (Flickr solo manda 25 fotos en el HTML; las otras 75 se cargan al hacer scroll.)
+    Si salen menos de 100, reintenta y junta lo encontrado en cada intento."""
     found, last = set(), n
     for attempt in range(tries):
         page.goto(f"https://www.flickr.com/photos/{FLICKR_USER}/page{n}",
                   wait_until="domcontentloaded", timeout=90000)
-        previous = -1
-        for _ in range(40):
-            page.mouse.wheel(0, 3000)
-            page.wait_for_timeout(500)
+        previous, stable = -1, 0
+        for _ in range(90):
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(800)
             count = len(set(PHOTO_ID_RE.findall(page.content())))
-            if count >= 100 or (count == previous and count > 0 and _ > 8):
+            if count >= 100:
+                break
+            stable = stable + 1 if count == previous else 0
+            if stable >= 8:          # 6-7 segundos sin cargar nada nuevo
                 break
             previous = count
         html_text = page.content()
-        found = {int(x) for x in PHOTO_ID_RE.findall(html_text)}
+        found |= {int(x) for x in PHOTO_ID_RE.findall(html_text)}
         pages = [int(x) for x in re.findall(rf"/photos/{FLICKR_USER}/page(\d+)", html_text)]
-        last = max(pages + [n])
-        if found:
-            return found, last
-        time.sleep(10 * (attempt + 1))
+        last = max(pages + [last])
+        if len(found) >= 100 or (found and n >= last):
+            break
+        page.wait_for_timeout(3000 * (attempt + 1))
     return found, last
 
 
-def update_ids(ids):
+def open_browser(pw):
+    browser = pw.chromium.launch()
+    page = browser.new_page(user_agent=BROWSER_UA, locale="en-US",
+                            viewport={"width": 1400, "height": 1000})
+    return browser, page
+
+
+def update_ids(ids, state):
     """Primera vez: recorre todo el photostream. Después: solo las páginas nuevas."""
     from playwright.sync_api import sync_playwright
 
     known = set(ids)
     first_run = not ids
     with sync_playwright() as pw:
-        browser = pw.chromium.launch()
-        page = browser.new_page(user_agent=BROWSER_UA, locale="en-US",
-                                viewport={"width": 1400, "height": 1000})
+        browser, page = open_browser(pw)
         found, last_page = ids_in_page(page, 1)
         print(f"Página 1 de Flickr: {len(found)} fotos (de {last_page} páginas)")
         known |= found
@@ -120,8 +129,31 @@ def update_ids(ids):
             n += 1
             found, maybe_last = ids_in_page(page, n)
             last_page = max(last_page, maybe_last)
-            if len(found) < 90 and n < last_page:
+            if len(found) < 95 and n < last_page:
                 print(f"Aviso: la página {n} de Flickr solo ha dado {len(found)} fotos.")
+            known |= found
+        browser.close()
+    state["flickr_pages"] = last_page
+    return sorted(known)
+
+
+def refresh_around(ids, state):
+    """Vuelve a leer las páginas de Flickr donde está ahora la cola, para recuperar
+    fotos que se hubieran escapado. Así los huecos se rellenan justo antes de publicar."""
+    from bisect import bisect_right
+    from playwright.sync_api import sync_playwright
+
+    newer = len(ids) - bisect_right(ids, state["last_id"])   # fotos más nuevas que el puntero
+    center = newer // 100 + 1
+    last_page = state.get("flickr_pages", center + 1)
+    known = set(ids)
+    with sync_playwright() as pw:
+        browser, page = open_browser(pw)
+        for n in range(max(1, center - 1), min(last_page, center + 1) + 1):
+            found, _ = ids_in_page(page, n)
+            new = found - known
+            if new:
+                print(f"Recuperadas {len(new)} fotos que faltaban (página {n}).")
             known |= found
         browser.close()
     return sorted(known)
@@ -419,12 +451,14 @@ def log_published(info, media_id):
 def main():
     state = load_json(STATE_FILE, {})
     state.setdefault("failures", {})
-    ids = update_ids(load_json(IDS_FILE, []))
+    ids = update_ids(load_json(IDS_FILE, []), state)
     print(f"Fotos conocidas en Flickr: {len(ids)}")
 
     if not state.get("last_id"):
         print(f"Buscando la primera foto subida a partir del {START_DATE}...")
         state["last_id"] = find_start(ids, START_DATE)
+
+    ids = refresh_around(ids, state)
 
     if not DRY_RUN:
         git("config", "user.name", "milbeerista-bot")
