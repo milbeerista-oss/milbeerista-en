@@ -46,18 +46,16 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 IG_TOKEN = os.environ.get("IG_TOKEN", "")
 
-# Flickr envía la página completa (100 fotos por página) a programas que no se hacen
-# pasar por un navegador; a un navegador le manda solo 25 y carga el resto con JavaScript.
-HEADERS = {
-    "User-Agent": "milbeerista-bot/1.0 (+https://github.com)",
-    "Accept-Language": "en-US,en;q=0.9",
-}
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/128.0 Safari/537.36")
+HEADERS = {"User-Agent": BROWSER_UA, "Accept-Language": "en-US,en;q=0.9"}
 
 TRANSLATION_PROMPT = """You translate Catalan craft-beer reviews into natural English for an Instagram account.
 Rules:
 - Keep beer names, brewery names, place names, hop varieties, malt names and yeast strains exactly as written.
 - Keep numbers, IBUs and abbreviations as they are, but use a decimal point in numbers (6,7% -> 6.7%).
-- Translate every Catalan word, including short phrases such as "De Blanes" -> "From Blanes".
+- Translate every Catalan word, including short phrases such as "De Blanes" -> "From Blanes"
+  and "sense gluten" -> "gluten-free". The output must not contain any Catalan.
 - Keep the author's concise tasting-note style. Do not add or remove information.
 - Output only the English translation, with no quotes, notes or preamble."""
 
@@ -74,39 +72,58 @@ def fetch(url, tries=3):
     raise RuntimeError(f"Flickr no responde ({r.status_code}): {url}")
 
 
-def ids_in_page(n, tries=3):
-    """IDs de las fotos de una página del photostream (reintenta si sale vacía)."""
-    for i in range(tries):
-        page = fetch(f"https://www.flickr.com/photos/{FLICKR_USER}/page{n}") or ""
-        # Solo unas 20 fotos por página salen como imagen; el resto viene en los datos
-        # internos de la página (con barras escapadas \/ o como "id":"...").
-        found = {int(x) for x in re.findall(r"staticflickr\.com\\?/\d+\\?/(\d{6,})_[0-9a-f]{6,}_", page)}
-        found |= {int(x) for x in re.findall(r'"id"\s*:\s*"(\d{9,12})"', page)}
+PHOTO_ID_RE = re.compile(r"staticflickr\.com\\?/\d+\\?/(\d{6,})_[0-9a-f]{6,}_")
+
+
+def ids_in_page(page, n, tries=3):
+    """Abre una página del photostream en Chromium, hace scroll y devuelve sus fotos.
+    (Flickr solo manda 25 fotos en el HTML; las otras 75 se cargan al hacer scroll.)"""
+    found, last = set(), n
+    for attempt in range(tries):
+        page.goto(f"https://www.flickr.com/photos/{FLICKR_USER}/page{n}",
+                  wait_until="domcontentloaded", timeout=90000)
+        previous = -1
+        for _ in range(40):
+            page.mouse.wheel(0, 3000)
+            page.wait_for_timeout(500)
+            count = len(set(PHOTO_ID_RE.findall(page.content())))
+            if count >= 100 or (count == previous and count > 0 and _ > 8):
+                break
+            previous = count
+        html_text = page.content()
+        found = {int(x) for x in PHOTO_ID_RE.findall(html_text)}
+        pages = [int(x) for x in re.findall(rf"/photos/{FLICKR_USER}/page(\d+)", html_text)]
+        last = max(pages + [n])
         if found:
-            last = max([int(x) for x in re.findall(rf"/photos/{FLICKR_USER}/page(\d+)", page)] or [n])
             return found, last
-        time.sleep(10 * (i + 1))
-    return set(), n
+        time.sleep(10 * (attempt + 1))
+    return found, last
 
 
 def update_ids(ids):
     """Primera vez: recorre todo el photostream. Después: solo las páginas nuevas."""
+    from playwright.sync_api import sync_playwright
+
     known = set(ids)
     first_run = not ids
-    found, last_page = ids_in_page(1)
-    print(f"Página 1 de Flickr: {len(found)} fotos (de {last_page} páginas)")
-    known |= found
-    n = 1
-    while n < last_page:
-        if not first_run and found and not (found - set(ids)):
-            break
-        n += 1
-        time.sleep(1)
-        found, maybe_last = ids_in_page(n)
-        last_page = max(last_page, maybe_last)
-        if not found:
-            print(f"Aviso: la página {n} de Flickr ha salido vacía.")
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch()
+        page = browser.new_page(user_agent=BROWSER_UA, locale="en-US",
+                                viewport={"width": 1400, "height": 1000})
+        found, last_page = ids_in_page(page, 1)
+        print(f"Página 1 de Flickr: {len(found)} fotos (de {last_page} páginas)")
         known |= found
+        n = 1
+        while n < last_page:
+            if not first_run and found and not (found - set(ids)):
+                break
+            n += 1
+            found, maybe_last = ids_in_page(page, n)
+            last_page = max(last_page, maybe_last)
+            if len(found) < 90 and n < last_page:
+                print(f"Aviso: la página {n} de Flickr solo ha dado {len(found)} fotos.")
+            known |= found
+        browser.close()
     return sorted(known)
 
 
@@ -220,7 +237,7 @@ def translate_groq(body):
             "model": model,
             "messages": [{"role": "system", "content": TRANSLATION_PROMPT},
                          {"role": "user", "content": body}],
-            "temperature": 0.2,
+            "temperature": 0,
         }
         if model.startswith("openai/gpt-oss"):
             payload["reasoning_effort"] = "low"
