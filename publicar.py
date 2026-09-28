@@ -70,23 +70,35 @@ def fetch(url, tries=3):
     raise RuntimeError(f"Flickr no responde ({r.status_code}): {url}")
 
 
-def ids_in_page(n):
-    page = fetch(f"https://www.flickr.com/photos/{FLICKR_USER}/page{n}") or ""
-    return {int(x) for x in re.findall(r"staticflickr\.com/\d+/(\d{6,})_[0-9a-f]{6,}_", page)}
+def ids_in_page(n, tries=3):
+    """IDs de las fotos de una página del photostream (reintenta si sale vacía)."""
+    for i in range(tries):
+        page = fetch(f"https://www.flickr.com/photos/{FLICKR_USER}/page{n}") or ""
+        found = {int(x) for x in re.findall(r"staticflickr\.com/\d+/(\d{6,})_[0-9a-f]{6,}_", page)}
+        if found:
+            last = max([int(x) for x in re.findall(rf"/photos/{FLICKR_USER}/page(\d+)", page)] or [n])
+            return found, last
+        time.sleep(10 * (i + 1))
+    return set(), n
 
 
 def update_ids(ids):
     """Primera vez: recorre todo el photostream. Después: solo las páginas nuevas."""
     known = set(ids)
+    first_run = not ids
+    found, last_page = ids_in_page(1)
+    known |= found
     n = 1
-    while True:
-        found = ids_in_page(n)
-        new = found - known
-        known |= found
-        if not new or n >= 200:
+    while n < last_page:
+        if not first_run and found and not (found - set(ids)):
             break
         n += 1
         time.sleep(1)
+        found, maybe_last = ids_in_page(n)
+        last_page = max(last_page, maybe_last)
+        if not found:
+            print(f"Aviso: la página {n} de Flickr ha salido vacía.")
+        known |= found
     return sorted(known)
 
 
@@ -176,35 +188,81 @@ def split_hashtags(text):
     return body, tags[:MAX_HASHTAGS]
 
 
+def translate_gemini(body):
+    r = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+        params={"key": GEMINI_API_KEY},
+        json={
+            "system_instruction": {"parts": [{"text": TRANSLATION_PROMPT}]},
+            "contents": [{"parts": [{"text": body}]}],
+        },
+        timeout=90,
+    )
+    if not r.ok:
+        raise RuntimeError(f"Gemini: {r.status_code} {r.text[:300]}")
+    parts = r.json()["candidates"][0]["content"]["parts"]
+    return "".join(p.get("text", "") for p in parts).strip()
+
+
+def translate_claude(body):
+    r = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01"},
+        json={"model": CLAUDE_MODEL, "max_tokens": 1024, "system": TRANSLATION_PROMPT,
+              "messages": [{"role": "user", "content": body}]},
+        timeout=90,
+    )
+    if not r.ok:
+        raise RuntimeError(f"Claude: {r.status_code} {r.text[:300]}")
+    return "".join(b.get("text", "") for b in r.json()["content"] if b["type"] == "text").strip()
+
+
+def chunks(text, max_bytes=450):
+    """Parte el texto por frases en trozos que acepta MyMemory (máx. 500 bytes)."""
+    out, current = [], ""
+    for sentence in re.split(r"(?<=[.!?])\s+", text):
+        candidate = f"{current} {sentence}".strip()
+        if len(candidate.encode()) <= max_bytes:
+            current = candidate
+            continue
+        if current:
+            out.append(current)
+        while len(sentence.encode()) > max_bytes:          # frase larguísima: cortar por palabras
+            cut = sentence[:max_bytes // 2].rsplit(" ", 1)[0] or sentence[:max_bytes // 2]
+            out.append(cut)
+            sentence = sentence[len(cut):].strip()
+        current = sentence
+    if current:
+        out.append(current)
+    return out
+
+
+def translate_mymemory(body):
+    """Traductor gratuito sin clave (MyMemory). Calidad algo menor que una IA."""
+    pieces = []
+    for piece in chunks(body):
+        r = requests.get("https://api.mymemory.translated.net/get",
+                         params={"q": piece, "langpair": "ca|en"}, timeout=60)
+        data = r.json() if r.ok else {}
+        if data.get("responseStatus") != 200:
+            raise RuntimeError(f"MyMemory: {r.status_code} {str(data)[:300]}")
+        pieces.append(html.unescape(data["responseData"]["translatedText"]).strip())
+        time.sleep(1)
+    return re.sub(r"(\d),(\d)", r"\1.\2", " ".join(pieces))
+
+
 def translate(body):
+    """Prueba los traductores en orden: Gemini, Claude y, si no, MyMemory (gratis, sin clave)."""
     if not body:
         return ""
-    if GEMINI_API_KEY:
-        r = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-            params={"key": GEMINI_API_KEY},
-            json={
-                "system_instruction": {"parts": [{"text": TRANSLATION_PROMPT}]},
-                "contents": [{"parts": [{"text": body}]}],
-            },
-            timeout=90,
-        )
-        if not r.ok:
-            raise RuntimeError(f"Gemini: {r.status_code} {r.text}")
-        parts = r.json()["candidates"][0]["content"]["parts"]
-        return "".join(p.get("text", "") for p in parts).strip()
-    if ANTHROPIC_API_KEY:
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01"},
-            json={"model": CLAUDE_MODEL, "max_tokens": 1024, "system": TRANSLATION_PROMPT,
-                  "messages": [{"role": "user", "content": body}]},
-            timeout=90,
-        )
-        if not r.ok:
-            raise RuntimeError(f"Claude: {r.status_code} {r.text}")
-        return "".join(b.get("text", "") for b in r.json()["content"] if b["type"] == "text").strip()
-    raise RuntimeError("Falta GEMINI_API_KEY (o ANTHROPIC_API_KEY) para traducir")
+    for key, fn in ((GEMINI_API_KEY, translate_gemini), (ANTHROPIC_API_KEY, translate_claude)):
+        if key:
+            try:
+                return fn(body)
+            except Exception as e:
+                print(f"Aviso: falló la traducción ({e}). Pruebo la siguiente opción.")
+    print("Traduciendo con MyMemory (gratuito).")
+    return translate_mymemory(body)
 
 
 def build_caption(title, body_en, tags):
